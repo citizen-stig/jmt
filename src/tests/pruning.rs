@@ -264,7 +264,6 @@ fn inserts_and_updates_prune_exactly() {
 /// A version whose writes have no effect (deleting an absent key) copies the previous root to the
 /// new version in `TreeCache::freeze`, but never indexes the previous root as stale.
 #[test]
-#[ignore = "known bug: no-op versions leak the previous root"]
 fn noop_version_indexes_previous_root_as_stale() {
     let a = key_with_nibbles(&[(0, 1)]);
     let b = key_with_nibbles(&[(0, 2)]);
@@ -279,7 +278,6 @@ fn noop_version_indexes_previous_root_as_stale() {
 
 /// Same as above, but the no-op version is an empty value set.
 #[test]
-#[ignore = "known bug: no-op versions leak the previous root"]
 fn empty_version_indexes_previous_root_as_stale() {
     let a = key_with_nibbles(&[(0, 1)]);
     let b = key_with_nibbles(&[(0, 2)]);
@@ -294,7 +292,6 @@ fn empty_version_indexes_previous_root_as_stale() {
 /// When the tree becomes empty a `Null` root is written for that version. Inserting into the
 /// empty tree at a later version never indexes that `Null` root as stale.
 #[test]
-#[ignore = "known bug: the Null root leaks when the tree is refilled"]
 fn null_root_is_indexed_as_stale_when_tree_is_refilled() {
     let a = key_with_nibbles(&[(0, 1)]);
 
@@ -307,7 +304,6 @@ fn null_root_is_indexed_as_stale_when_tree_is_refilled() {
 
 /// Same as above, but the tree is refilled with `batch_put_value_sets`.
 #[test]
-#[ignore = "known bug: the Null root leaks when the tree is refilled"]
 fn null_root_is_indexed_as_stale_when_tree_is_refilled_with_batch_api() {
     let a = key_with_nibbles(&[(0, 1)]);
 
@@ -359,7 +355,6 @@ fn insert_and_delete_in_same_version_prunes_exactly() {
 /// same as the new ones, so indexing them as stale makes pruning delete the live tree.
 #[cfg(feature = "migration")]
 #[test]
-#[ignore = "known bug: append_value_set indexes live nodes as stale"]
 fn append_value_set_does_not_prune_live_nodes() {
     let a = key_with_nibbles(&[(0, 1)]);
     let b = key_with_nibbles(&[(0, 2)]);
@@ -391,7 +386,6 @@ fn append_value_set_does_not_prune_live_nodes() {
 /// pruning delete nodes recreated by a later append.
 #[cfg(feature = "migration")]
 #[test]
-#[ignore = "known bug: append_value_set indexes live nodes as stale"]
 fn append_value_set_with_deletions_does_not_prune_live_nodes() {
     // `a` and `b` share the internal node at nibble path `1`.
     let a = key_with_nibbles(&[(0, 1), (1, 1)]);
@@ -544,7 +538,6 @@ proptest! {
     /// Random inserts, updates and deletes, committed in single- and multi-version batches and
     /// pruned with a random lag.
     #[test]
-    #[ignore = "known bug: no-op versions and the Null root leak"]
     fn proptest_pruning_keeps_exactly_retained_versions(workload in arb_workload(true)) {
         run_workload(workload);
     }
