@@ -450,6 +450,10 @@ where
 
     #[cfg(feature = "migration")]
     /// Append value sets to the latest version of the tree, without incrementing its version.
+    ///
+    /// Nodes of the latest version are rewritten in place under the same keys. Nodes of the
+    /// latest version that are no longer part of the tree are returned in
+    /// [`TreeUpdateBatch::removed_nodes`] and must be deleted when the batch is written.
     pub fn append_value_set(
         &self,
         value_set: impl IntoIterator<Item = (KeyHash, Option<OwnedValue>)>,

@@ -181,6 +181,15 @@ impl MockTreeStore {
 
     pub fn write_tree_update_batch(&self, batch: TreeUpdateBatch) -> Result<()> {
         self.write_node_batch(&batch.node_batch)?;
+        {
+            let mut locked = self.data.write();
+            for node_key in &batch.removed_nodes {
+                ensure!(
+                    locked.nodes.remove(node_key).is_some(),
+                    "Removed node {node_key:?} does not exist."
+                );
+            }
+        }
         batch
             .stale_node_index_batch
             .into_iter()

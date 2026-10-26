@@ -64,9 +64,19 @@ struct PruningHarness {
 
 impl PruningHarness {
     fn new() -> Self {
+        Self::with_stores(MockTreeStore::default(), MockTreeStore::default())
+    }
+
+    /// A harness whose stores accept nodes being rewritten in place, for `append_value_set`.
+    #[cfg(feature = "migration")]
+    fn with_overwrite() -> Self {
+        Self::with_stores(MockTreeStore::new(true), MockTreeStore::new(true))
+    }
+
+    fn with_stores(archive: MockTreeStore, pruned: MockTreeStore) -> Self {
         Self {
-            archive: MockTreeStore::default(),
-            pruned: MockTreeStore::default(),
+            archive,
+            pruned,
             states: Vec::new(),
             keys: BTreeSet::new(),
             least_readable_version: 0,
@@ -126,6 +136,52 @@ impl PruningHarness {
         }
 
         self.assert_stale_index_is_exact(&batch, first_version..=self.latest_version());
+    }
+
+    /// Appends `value_set` to the latest version in place with `append_value_set`.
+    ///
+    /// Checks that the nodes replaced by the append are exactly the nodes indexed as stale, for
+    /// nodes of earlier versions, and the removed nodes, for nodes of the latest version.
+    #[cfg(feature = "migration")]
+    fn append(&mut self, value_set: ValueSet) -> TreeUpdateBatch {
+        let version = self.latest_version();
+        let before = reachable_nodes(&self.archive, version);
+        let (_, batch) = JellyfishMerkleTree::<_, Sha256>::new(&self.pruned)
+            .append_value_set(value_set.clone(), version)
+            .unwrap_or_else(|e| panic!("failed to append to version {version}: {e:?}"));
+        self.write(batch.clone());
+
+        let state = self.states.last_mut().unwrap();
+        for (key, value) in value_set {
+            self.keys.insert(key);
+            match value {
+                Some(value) => state.insert(key, value),
+                None => state.remove(&key),
+            };
+        }
+
+        let after = reachable_nodes(&self.archive, version);
+        let (expected_removed, expected_stale): (BTreeSet<NodeKey>, BTreeSet<NodeKey>) = before
+            .difference(&after)
+            .cloned()
+            .partition(|node_key| node_key.version() == version);
+        let stale: BTreeSet<NodeKey> = batch
+            .stale_node_index_batch
+            .iter()
+            .map(|index| {
+                assert_eq!(index.stale_since_version, version, "{index:?}");
+                index.node_key.clone()
+            })
+            .collect();
+        assert_eq!(
+            stale, expected_stale,
+            "append to version {version}: wrong stale index"
+        );
+        assert_eq!(
+            batch.removed_nodes, expected_removed,
+            "append to version {version}: wrong removed nodes",
+        );
+        batch
     }
 
     fn write(&self, batch: TreeUpdateBatch) {
@@ -352,7 +408,7 @@ fn insert_and_delete_in_same_version_prunes_exactly() {
 }
 
 /// `append_value_set` rewrites nodes in place at the latest version. Their old node keys are the
-/// same as the new ones, so indexing them as stale makes pruning delete the live tree.
+/// same as the new ones, so they must not be indexed as stale.
 #[cfg(feature = "migration")]
 #[test]
 fn append_value_set_does_not_prune_live_nodes() {
@@ -360,87 +416,35 @@ fn append_value_set_does_not_prune_live_nodes() {
     let b = key_with_nibbles(&[(0, 2)]);
     let c = key_with_nibbles(&[(0, 3)]);
 
-    let db = MockTreeStore::new(true /* allow_overwrite */);
-    let tree = JellyfishMerkleTree::<_, Sha256>::new(&db);
-    let (_, batch) = tree.put_value_set(vec![put(a, 1), put(b, 1)], 0).unwrap();
-    db.write_tree_update_batch(batch).unwrap();
-
-    let (root, batch) = tree.append_value_set(vec![put(c, 1)], 0).unwrap();
-    db.write_tree_update_batch(batch).unwrap();
-    assert_eq!(tree.get_root_hash(0).unwrap(), root);
-
-    // Version 0 is still the latest version, so it must stay readable.
-    db.purge_stale_nodes(0).unwrap();
-    assert_eq!(
-        tree.get_root_hash(0).unwrap(),
-        root,
-        "root of version 0 was pruned"
-    );
-    for key in [a, b, c] {
-        assert_eq!(tree.get(key, 0).unwrap(), Some(vec![1]));
-    }
+    let mut harness = PruningHarness::with_overwrite();
+    harness.commit(vec![vec![put(a, 1), put(b, 1)]]);
+    harness.append(vec![put(c, 1)]);
+    harness.prune(0);
 }
 
 /// Appends that delete and re-insert a key remove nodes of the latest version and later recreate
-/// nodes under the same keys. Stale index entries written by an earlier append must not make
-/// pruning delete nodes recreated by a later append.
+/// nodes under the same keys. The removed nodes must be deleted right away rather than indexed as
+/// stale, otherwise pruning would delete the nodes recreated by the later append.
 #[cfg(feature = "migration")]
 #[test]
-fn append_value_set_with_deletions_does_not_prune_live_nodes() {
+fn append_value_set_with_deletions_removes_exactly_replaced_nodes() {
     // `a` and `b` share the internal node at nibble path `1`.
     let a = key_with_nibbles(&[(0, 1), (1, 1)]);
     let b = key_with_nibbles(&[(0, 1), (1, 2)]);
     let c = key_with_nibbles(&[(0, 2)]);
 
-    let db = MockTreeStore::new(true /* allow_overwrite */);
-    let tree = JellyfishMerkleTree::<_, Sha256>::new(&db);
-    let (_, batch) = tree
-        .put_value_set(vec![put(a, 1), put(b, 1), put(c, 1)], 0)
-        .unwrap();
-    db.write_tree_update_batch(batch).unwrap();
-
+    let mut harness = PruningHarness::with_overwrite();
+    harness.commit(vec![vec![put(a, 1), put(b, 1), put(c, 1)]]);
     // Collapses the internal node at path `1` into the leaf of `a`...
-    let (_, batch) = tree.append_value_set(vec![delete(b)], 0).unwrap();
-    db.write_tree_update_batch(batch).unwrap();
+    let batch = harness.append(vec![delete(b)]);
+    assert!(!batch.removed_nodes.is_empty());
     // ...and splits it again, recreating the nodes removed by the previous append.
-    let (root, batch) = tree.append_value_set(vec![put(b, 2)], 0).unwrap();
-    db.write_tree_update_batch(batch).unwrap();
+    harness.append(vec![put(b, 2)]);
+    harness.prune(0);
 
-    db.purge_stale_nodes(0).unwrap();
-    let missing: Vec<_> = reachable_nodes_option(&db, 0)
-        .into_iter()
-        .filter(|(_, exists)| !exists)
-        .collect();
-    assert!(missing.is_empty(), "live nodes were pruned: {missing:?}");
-    assert_eq!(tree.get_root_hash(0).unwrap(), root);
-    assert_eq!(tree.get(a, 0).unwrap(), Some(vec![1]));
-    assert_eq!(tree.get(b, 0).unwrap(), Some(vec![2]));
-    assert_eq!(tree.get(c, 0).unwrap(), Some(vec![1]));
-
-    // Regular versions on top of the appended version keep pruning correctly.
-    let (_, batch) = tree.put_value_set(vec![put(a, 3)], 1).unwrap();
-    db.write_tree_update_batch(batch).unwrap();
-    db.purge_stale_nodes(1).unwrap();
-    assert_eq!(tree.get(a, 1).unwrap(), Some(vec![3]));
-    assert_eq!(tree.get(b, 1).unwrap(), Some(vec![2]));
-    assert_eq!(tree.get(c, 1).unwrap(), Some(vec![1]));
-}
-
-/// Like `reachable_nodes`, but reports missing nodes instead of panicking.
-#[cfg(feature = "migration")]
-fn reachable_nodes_option<R: TreeReader>(reader: &R, version: Version) -> Vec<(NodeKey, bool)> {
-    let mut reachable = Vec::new();
-    let mut stack = vec![NodeKey::new_empty_path(version)];
-    while let Some(node_key) = stack.pop() {
-        let node = reader.get_node_option(&node_key).unwrap();
-        if let Some(Node::Internal(internal)) = &node {
-            for (nibble, child) in internal.children_unsorted() {
-                stack.push(node_key.gen_child_node_key(child.version, nibble));
-            }
-        }
-        reachable.push((node_key, node.is_some()));
-    }
-    reachable
+    // Regular versions on top of the appended version keep pruning exactly.
+    harness.commit(vec![vec![put(a, 3)]]);
+    harness.prune(1);
 }
 
 /// A small key universe with long shared prefixes, so that random workloads hit splits of leaves
@@ -530,6 +534,49 @@ fn without_noop_versions(workload: Vec<Commit>) -> Vec<Commit> {
         }
     }
     filtered
+}
+
+/// The largest key, so that it is always the rightmost leaf. `append_value_set` requires the
+/// rightmost leaf to be from the latest version, so every round of the append workload rewrites it.
+#[cfg(feature = "migration")]
+const SENTINEL_KEY: KeyHash = KeyHash([0xff; 32]);
+
+/// Rounds of one regular version followed by appends to that version.
+#[cfg(feature = "migration")]
+fn arb_append_workload() -> impl Strategy<Value = Vec<(ValueSet, Vec<ValueSet>)>> {
+    proptest::collection::vec(
+        (
+            arb_value_set(true),
+            proptest::collection::vec(arb_value_set(true), 0..4),
+        ),
+        1..10,
+    )
+}
+
+#[cfg(feature = "migration")]
+fn run_append_workload(workload: Vec<(ValueSet, Vec<ValueSet>)>) {
+    let mut harness = PruningHarness::with_overwrite();
+    for (round, (mut value_set, appends)) in workload.into_iter().enumerate() {
+        value_set.push(put(SENTINEL_KEY, round as u8));
+        harness.commit(vec![value_set]);
+        // Only the latest version may remain, so that the store has a single rightmost leaf.
+        harness.prune(harness.latest_version());
+        for value_set in appends {
+            harness.append(value_set);
+        }
+        harness.prune(harness.latest_version());
+    }
+}
+
+#[cfg(feature = "migration")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Random appends, including deletions, on top of random regular versions.
+    #[test]
+    fn proptest_append_value_set_prunes_exactly(workload in arb_append_workload()) {
+        run_append_workload(workload);
+    }
 }
 
 proptest! {
